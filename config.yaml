@@ -1,0 +1,149 @@
+# Polymarket Maker Rebates Bot - Configuration
+# This file contains all configurable parameters
+
+# ============================================================================
+# POLYMARKET API
+# ============================================================================
+polymarket:
+  api_url: "https://clob.polymarket.com"
+  ws_url: "wss://clob-ws.polymarket.com"
+  chain_id: 137  # Polygon
+
+# ============================================================================
+# AUTHENTICATION
+# ============================================================================
+auth:
+  private_key: "${PRIVATE_KEY}"
+  public_address: "${PUBLIC_ADDRESS}"
+
+# ============================================================================
+# MARKET DISCOVERY
+# ============================================================================
+market_discovery:
+  enabled: true
+  window_minutes: 15
+  # Filter for 15-minute crypto markets only
+  categories:
+    - "crypto"
+    - "bitcoin"
+    - "ethereum"
+  exclude_categories:
+    - "sports"
+    - "politics"
+    - "entertainment"
+
+# ============================================================================
+# QUOTING STRATEGY
+# ============================================================================
+quoting:
+  # Order sizing
+  default_size: 10.0
+  min_size: 1.0
+  max_size: 100.0
+
+  # Spread configuration (basis points)
+  min_spread_bps: 10      # 0.10%
+  max_spread_bps: 50      # 0.50%
+  spread_step_bps: 5      # 0.05%
+
+  # Price positioning from best bid/ask
+  best_bid_offset_bps: 5  # Place 0.05% above best bid
+  best_ask_offset_bps: 5  # Place 0.05% below best ask
+
+  # Quote refresh timing
+  quote_refresh_rate_ms: 1000
+  order_lifetime_ms: 3000
+
+  # Cancel/Replace cycle
+  cancel_replace_interval_ms: 500
+  taker_delay_ms: 500
+  batch_cancellations: true
+
+# ============================================================================
+# INVENTORY MANAGEMENT
+# ============================================================================
+inventory:
+  # Exposure limits (USD)
+  max_exposure_usd: 1000.0
+  min_exposure_usd: -1000.0
+  target_net_exposure: 0.0
+
+  # Position limits
+  max_position_size_usd: 500.0
+  max_single_order_usd: 100.0
+
+  # Skew protection
+  max_inventory_skew: 0.3  # 30% max imbalance
+  skew_rebalance_factor: 0.5
+
+# ============================================================================
+# RISK MANAGEMENT
+# ============================================================================
+risk:
+  # Stop loss
+  stop_loss_pct: 10.0
+  stop_loss_cooldown_minutes: 30
+
+  # Volume limits
+  max_daily_volume_usd: 5000.0
+  max_orders_per_minute: 60
+
+  # Rebate optimization
+  min_fill_probability: 0.5
+  require_fee_market_only: true
+
+  # Validation
+  pre_trade_validation: true
+  post_trade_validation: true
+
+# ============================================================================
+# AUTO-REDEEM
+# ============================================================================
+auto_redeem:
+  enabled: true
+  threshold_usd: 1.0
+  auto_merge_enabled: true
+  check_interval_seconds: 60
+
+# ============================================================================
+# GAS OPTIMIZATION
+# ============================================================================
+gas:
+  batching_enabled: true
+  gas_price_gwei: 30.0
+  max_gas_percentage: 5.0
+  priority: "standard"
+
+# ============================================================================
+# POLYGON RPC
+# ============================================================================
+polygon:
+  rpc_url: "${RPC_URL}"
+  gas_oracle_url: "https://gasstation.polygon.technology/v2"
+
+# ============================================================================
+# MONITORING
+# ============================================================================
+monitoring:
+  log_level: "INFO"
+  metrics:
+    enabled: true
+    host: "0.0.0.0"
+    port: 9305
+  structured_logging: true
+
+  # Telegram alerts
+  telegram:
+    enabled: false
+    bot_token: ""
+    chat_id: ""
+
+# ============================================================================
+# BOT SETTINGS
+# ============================================================================
+bot:
+  name: "polymr-maker-bot"
+  test_mode: true
+  startup_delay_seconds: 5
+  shutdown_grace_period: 10
+  graceful_shutdown: true
