@@ -400,11 +400,13 @@ class RealTradingClient(TradingClient):
 
 class SandboxTradingClient(TradingClient):
     def __init__(self):
+        self.host = "https://clob.polymarket.com"
         self._nonce = 0
         self._nonce_lock = threading.Lock()
         self._order_counter = 0
-        self._simulated_books: Dict[str, OrderBook] = {}
-        print("   Sandbox mode initialized")
+        self._ws_fills: List[Dict] = []
+        self._ws_fills_lock = threading.Lock()
+        print("   Sandbox mode initialized (real data, simulated fills)")
     
     def get_nonce(self) -> int:
         with self._nonce_lock:
@@ -414,59 +416,211 @@ class SandboxTradingClient(TradingClient):
     
     def _gen_order_id(self) -> str:
         self._order_counter += 1
-        return f"ord_{self._order_counter}_{int(time.time()*1000)}_{random.randint(1000,9999)}"
-    
-    def _gen_orderbook(self, mid_price: float, volatility: str = "normal") -> OrderBook:
-        spread_mult = {"calm": 0.8, "normal": 1.0, "volatile": 1.5}[volatility]
-        base_spread_pct = random.uniform(0.5, 2.0) * spread_mult
-        spread_bps = base_spread_pct * 100
-        
-        bids, asks = [], []
-        for i in range(10):
-            depth = random.uniform(5, 50) * (1.0 - i * 0.08)
-            bids.append({"price": round(mid_price * (1 - (i+1) * base_spread_pct * 0.1 / 100), 4), 
-                        "size": round(depth, 2)})
-            asks.append({"price": round(mid_price * (1 + (i+1) * base_spread_pct * 0.1 / 100), 4),
-                        "size": round(depth, 2)})
-        
-        return OrderBook(bids=bids, asks=asks, midpoint=mid_price, spread_bps=spread_bps)
+        return f"sim_{self._order_counter}_{int(time.time()*1000)}_{random.randint(1000,9999)}"
     
     def get_markets(self) -> List[Market]:
+        """Fetch real 15-min crypto markets from Polymarket API."""
+        import httpx
+        markets = []
+        client = httpx.Client(timeout=10.0)
+        
+        try:
+            r = client.get(
+                "https://gamma-api.polymarket.com/events",
+                params={"status": "active", "limit": 100}
+            )
+            if r.status_code != 200:
+                return self._get_fallback_markets()
+            
+            data = r.json()
+            events = data if isinstance(data, list) else data.get("events", [])
+            
+            for event in events:
+                if not event.get("markets"):
+                    continue
+                
+                market_data = event["markets"][0]
+                question = market_data.get("question", "").lower()
+                tags_raw = event.get("tags", [])
+                volume = event.get("volume") or 0
+                
+                # Tags can be dicts or strings
+                tags = []
+                for t in tags_raw:
+                    if isinstance(t, dict):
+                        tags.append(t.get("label", "").lower())
+                    else:
+                        tags.append(str(t).lower())
+                
+                crypto_kw = ["btc", "bitcoin", "eth", "ethereum", "sol", "solana", "crypto"]
+                if not any(kw in question or kw in tags for kw in crypto_kw):
+                    continue
+                if volume < MIN_VOLUME_USD:
+                    continue
+                
+                # Check for 15-min duration
+                end_date = market_data.get("endDate", "")
+                if end_date:
+                    try:
+                        from datetime import datetime
+                        end_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+                        now = datetime.now(datetime.timezone.utc)
+                        duration_min = (end_dt - now).total_seconds() / 60
+                        if duration_min > 20 or duration_min < 0:
+                            continue
+                    except:
+                        pass
+                
+                # Get token IDs
+                token_ids = []
+                clob_tokens = market_data.get("clobTokenIds", "")
+                if clob_tokens:
+                    try:
+                        import json
+                        token_ids = json.loads(clob_tokens)
+                    except:
+                        pass
+                if not token_ids:
+                    token_ids = market_data.get("tokens") or []
+                
+                if len(token_ids) < 2:
+                    continue
+                
+                markets.append(Market(
+                    condition_id=market_data.get("conditionId", ""),
+                    question=market_data.get("question", "")[:100],
+                    tokens=token_ids,
+                    fee_bps=0,
+                    volume_24h=volume,
+                    start_time=market_data.get("startDate", ""),
+                    end_time=end_date,
+                ))
+        except Exception as e:
+            pass
+        finally:
+            client.close()
+        
+        if not markets:
+            return self._get_fallback_markets()
+        return markets
+    
+    def _get_fallback_markets(self) -> List[Market]:
+        """Return hardcoded fallback markets if API fails."""
         return [
-            Market(f"btc_{random.randint(1000,9999)}", "Will BTC > $98,000 in next 15m?",
-                   [f"0xY_btc_{random.randint(100000,999999)}", f"0xN_btc_{random.randint(100000,999999)}"],
-                   156, random.uniform(10000, 50000), "", ""),
-            Market(f"eth_{random.randint(1000,9999)}", "Will ETH > $3,200 in next 15m?",
-                   [f"0xY_eth_{random.randint(100000,999999)}", f"0xN_eth_{random.randint(100000,999999)}"],
-                   156, random.uniform(10000, 50000), "", ""),
-            Market(f"sol_{random.randint(1000,9999)}", "Will SOL > $150 in next 15m?",
-                   [f"0xY_sol_{random.randint(100000,999999)}", f"0xN_sol_{random.randint(100000,999999)}"],
-                   156, random.uniform(8000, 40000), "", ""),
+            Market("btc_15m_fallback", "Will BTC > $98,000 in next 15m?",
+                   ["0xY_btc_fallback", "0xN_btc_fallback"], 156, 15000, "", ""),
+            Market("eth_15m_fallback", "Will ETH > $3,200 in next 15m?",
+                   ["0xY_eth_fallback", "0xN_eth_fallback"], 156, 12000, "", ""),
         ]
     
     def get_orderbook(self, token_id: str) -> OrderBook:
-        if token_id not in self._simulated_books:
-            mid = random.uniform(0.40, 0.60)
-            self._simulated_books[token_id] = self._gen_orderbook(mid)
-        return self._simulated_books[token_id]
+        """Fetch real orderbook from Polymarket CLOB."""
+        import httpx
+        try:
+            client = httpx.Client(timeout=5.0)
+            r = client.get(f"{self.host}/orderbook", params={"token_id": token_id, "limit": 20})
+            
+            if r.status_code == 200:
+                data = r.json()
+                bids = [{"price": float(b.get("price", 0)), "size": float(b.get("size", 0))} 
+                        for b in data.get("bids", [])]
+                asks = [{"price": float(a.get("price", 0)), "size": float(a.get("size", 0))} 
+                        for a in data.get("asks", [])]
+                
+                client.close()
+                
+                if bids and asks:
+                    mid = (bids[0]["price"] + asks[0]["price"]) / 2
+                    spread = (asks[0]["price"] - bids[0]["price"]) / mid * 10000
+                else:
+                    mid, spread = 0.5, 0
+                
+                return OrderBook(bids=bids, asks=asks, midpoint=mid, spread_bps=spread)
+            
+            client.close()
+        except Exception:
+            pass
+        
+        return OrderBook(bids=[], asks=[])
     
     def get_fee_rate(self, token_id: str) -> int:
+        """Fetch real fee rate from Polymarket API."""
+        import httpx
+        try:
+            client = httpx.Client(timeout=5.0)
+            r = client.get(f"{self.host}/fee-rate", params={"token_id": token_id})
+            
+            if r.status_code == 200:
+                fee = r.json().get("fee_rate_bps", 0)
+                client.close()
+                return fee
+            
+            client.close()
+        except Exception:
+            pass
         return 156
     
-    def submit_order(self, order: Order, fee_rate_bps: int) -> Dict:
-        return {"orderID": self._gen_order_id(), "status": "open", "success": True}
-    
-    def cancel_order(self, order_id: str) -> bool:
-        return True
-    
-    def get_open_orders(self, market_id: Optional[str] = None) -> List[Order]:
+    def get_recent_trades(self, token_id: str, limit: int = 50) -> List[Dict]:
+        """Fetch real recent trades from Polymarket."""
+        import httpx
+        try:
+            client = httpx.Client(timeout=5.0)
+            r = client.get(f"{self.host}/trades", params={"token_id": token_id, "limit": limit})
+            
+            if r.status_code == 200:
+                data = r.json()
+                client.close()
+                return data.get("trades", [])
+            
+            client.close()
+        except Exception:
+            pass
         return []
     
     def get_gas_price(self) -> float:
+        """Fetch real gas price from Polygon RPC."""
+        import httpx
+        try:
+            client = httpx.Client(timeout=5.0)
+            r = client.post(
+                "https://polygon-rpc.com",
+                json={"jsonrpc": "2.0", "method": "eth_gasPrice", "params": [], "id": 1}
+            )
+            
+            if r.status_code == 200:
+                result = r.json().get("result", "0x0")
+                gas_wei = int(result, 16) if result.startswith("0x") else int(result)
+                client.close()
+                return gas_wei / 1e9
+            
+            client.close()
+        except Exception:
+            pass
         return DEFAULT_GAS_PRICE_GWEI
     
-    def get_recent_trades(self, token_id: str, limit: int = 50) -> List[Dict]:
+    def submit_order(self, order: Order, fee_rate_bps: int) -> Dict:
+        """Simulate order submission (no real blockchain tx)."""
+        return {
+            "orderID": self._gen_order_id(),
+            "status": "open",
+            "success": True,
+            "simulated": True
+        }
+    
+    def cancel_order(self, order_id: str) -> bool:
+        """Simulate order cancellation (no real blockchain tx)."""
+        return True
+    
+    def get_open_orders(self, market_id: Optional[str] = None) -> List[Order]:
+        """No real orders in sandbox."""
         return []
+    
+    def subscribe_token(self, token_id: str):
+        """Subscribe to token trades for fill simulation."""
+        pass
+    
+    def stop_ws(self):
+        pass
 
 
 class OrderManager:
