@@ -12,9 +12,9 @@ A unified platform for **passive income** through DeFi yield farming and **Polym
 
 ### 2. Polymarket Maker Rebates (Backend)
 - Provide liquidity to 15-minute crypto markets
-- Earn **100% rebate** on taker fees (limited time)
+- Earn **20% rebate** on taker fees (Jan 12-18, 2026 promo)
 - Daily USDC payouts
-- Fully automated trading bot
+- Fully automated trading bot with real-time fills
 
 ---
 
@@ -52,14 +52,16 @@ source .venv/bin/activate  # Linux/Mac
 # Install dependencies
 pip install -r requirements.txt
 
-# Configure environment
-cp .env.example .env
-# Edit .env with your PRIVATE_KEY and PUBLIC_ADDRESS
+# Install py_clob_client for real trading
+pip install py_clob_client
 
-# Run in test mode
-python -m polymr.main
+# Sandbox mode (simulated fills, real market data)
+python run_bot.py 60 2 --sandbox
 
-# For production, set TEST_MODE=false in .env
+# Real mode (requires credentials)
+export POLYMARKET_PRIVATE_KEY=your_key
+export POLYMARKET_FUNDER=your_address
+python run_bot.py 60 2 --real
 ```
 
 ---
@@ -88,22 +90,23 @@ python -m polymr.main
 **Revenue Model:**
 - Place maker (limit) orders on 15-minute crypto markets
 - When takers fill your orders, you earn rebates on their fees
-- **Current rebate rate: 100%** (limited time offer)
+- **Current rebate rate: 20%** (Jan 12-18, 2026 promo period)
 - Daily USDC payouts to your wallet
 
-**Bot Configuration:**
-```env
-# In .env file
-PRIVATE_KEY=your_private_key        # From MetaMask
-PUBLIC_ADDRESS=your_address         # Your wallet address
-RPC_URL=https://polygon-rpc.com     # Polygon RPC
+**Bot Configuration (run_bot.py):**
+```bash
+# Aggression levels:
+# 1 = Conservative (10% capital per order, 15-50 bps spread)
+# 2 = Moderate (20% capital per order, 8-30 bps spread)  
+# 3 = Aggressive (30% capital per order, 3-20 bps spread)
 
-# Start small
-DEFAULT_SIZE=10.0
-MAX_EXPOSURE_USD=1000.0
+# Sandbox mode (recommended for testing)
+python run_bot.py 60 2 --sandbox
 
-# Enable for production
-TEST_MODE=false
+# Real trading (requires environment variables)
+export POLYMARKET_PRIVATE_KEY=your_wallet_private_key
+export POLYMARKET_FUNDER=your_funder_address
+python run_bot.py 60 2 --real
 ```
 
 ---
@@ -127,19 +130,8 @@ polymr/
 │       ├── DepositModal.tsx      # Yield calculator
 │       └── Portfolio.tsx         # Positions dashboard
 │
-├── polymr/                       # Python Backend
-│   ├── main.py                   # Bot orchestrator
-│   ├── config.py                 # Configuration management
-│   ├── polymarket/               # API clients
-│   │   ├── rest_client.py        # REST API
-│   │   └── websocket_client.py   # WebSocket
-│   ├── quoting/                  # Quote engine
-│   ├── execution/                # Order executor
-│   ├── risk/                     # Risk management
-│   └── monitoring/               # Metrics
-│
-├── config.yaml                   # Bot configuration
-├── .env.example                  # Environment template
+├── run_bot.py                    # Main trading bot (Real + Sandbox modes)
+├── launch.py                     # Interactive launcher
 ├── requirements.txt              # Python dependencies
 ├── package.json                  # Node dependencies
 └── README.md                     # This file
@@ -147,37 +139,39 @@ polymr/
 
 ---
 
-## ⚙️ Configuration
+## 🤖 Trading Bot Architecture
 
-### Frontend
-No configuration required. Runs out of the box.
+### TradingClient Interface
 
-### Backend (config.yaml)
-
-```yaml
-quoting:
-  default_size: 10.0          # Order size in USD
-  min_spread_bps: 10          # 0.10% minimum spread
-  max_spread_bps: 50          # 0.50% maximum spread
-
-inventory:
-  max_exposure_usd: 1000.0    # Maximum position size
-  max_inventory_skew: 0.3     # 30% max imbalance
-
-risk:
-  stop_loss_pct: 10.0         # Stop loss percentage
-  pre_trade_validation: true  # Validate before trading
-
-bot:
-  test_mode: true             # Set to false for production
+```python
+TradingClient (ABC)
+├── RealTradingClient          # Real trading via py_clob_client
+│   ├── EIP-712 order signing
+│   ├── WebSocket for fills (wss://ws-subscriptions-clob.polymarket.com)
+│   ├── Dynamic gas from Polygon RPC
+│   └── API credential management
+│
+└── SandboxTradingClient       # Real data, simulated fills
+    ├── Real markets from gamma-api.polymarket.com
+    ├── Real orderbook from clob.polymarket.com/orderbook
+    ├── Real fees from clob.polymarket.com/fee-rate
+    ├── Real trades from clob.polymarket.com/trades
+    └── Probabilistic fill simulation
 ```
+
+### Key Features
+- **Order Lifecycle**: submit → open → filled/cancelled/expired
+- **Nonce Management**: Atomic increment for order signing
+- **Gas Estimation**: Dynamic from `eth_gasPrice` RPC
+- **Fill Detection**: WebSocket + /trades polling fallback
+- **Risk Management**: Max position, net exposure, skew limits
 
 ---
 
 ## 🔒 Security
 
-- Never share your PRIVATE_KEY
-- Start with TEST_MODE=true
+- Never share your `POLYMARKET_PRIVATE_KEY`
+- Start with `--sandbox` mode
 - Use a dedicated wallet with limited funds
 - Monitor your positions regularly
 - Comply with Polymarket terms of service
@@ -186,14 +180,16 @@ bot:
 
 ## 📊 Monitoring
 
-### Prometheus Metrics
-Access at `http://localhost:9305/metrics`:
-- `polymr_orders_placed_total` - Total orders placed
-- `polymr_orders_filled_total` - Total fills (rebates earned)
-- `polymr_rebates_earned_usd` - Cumulative rebates in USDC
+The bot outputs real-time stats:
 
-### Logs
-Structured JSON logging with full audit trail.
+```
+Cycle 5 | Placed: 20 | Filled: 3
+  BTC > $98K in next 15m?
+  0.5627 | 156 bps | $31,679
+  📦 YES:5.2 NO:0.0 | Skew: 25%
+  BUY 24.00 @ 0.5610 | Gas: $0.04
+  📊 3/20 fills (15%) | Gas: $0.80 | Net: $1.20
+```
 
 ---
 
@@ -208,8 +204,20 @@ npm run preview      # Preview production build
 
 ### Run Backend
 ```bash
-python -m polymr.main                    # Run bot
-python -m polymr.main --config config.yaml  # Custom config
+# Sandbox (simulated trading)
+python run_bot.py 60 2 --sandbox
+
+# Real trading
+export POLYMARKET_PRIVATE_KEY=...
+export POLYMARKET_FUNDER=...
+python run_bot.py 60 2 --real
+```
+
+### Dependencies
+```
+py_clob_client>=0.34.0    # Official Polymarket CLOB client
+httpx                      # HTTP client for REST APIs
+websocket-client           # WebSocket for real-time fills
 ```
 
 ---
@@ -217,7 +225,7 @@ python -m polymr.main --config config.yaml  # Custom config
 ## ⚠️ Disclaimer
 
 This software is experimental. Use at your own risk. Past performance does not guarantee future results. Always:
-- Test thoroughly with small amounts
+- Test thoroughly with `--sandbox` mode first
 - Understand the risks of DeFi and market making
 - Never invest more than you can afford to lose
 
