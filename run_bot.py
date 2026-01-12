@@ -108,9 +108,10 @@ class TradingClient(ABC):
 
 
 class RealTradingClient(TradingClient):
-    def __init__(self):
+    def __init__(self, fill_callback=None):
         self.host = "https://clob.polymarket.com"
         self.chain_id = 137
+        self.fill_callback = fill_callback
         
         private_key = os.environ.get("POLYMARKET_PRIVATE_KEY")
         funder = os.environ.get("POLYMARKET_FUNDER")
@@ -130,7 +131,18 @@ class RealTradingClient(TradingClient):
         self._fee_cache: Dict[str, int] = {}
         self._fee_cache_time: Dict[str, float] = {}
         
+        self._ws = None
+        self._ws_thread = None
+        self._ws_running = False
+        self._subscribed_tokens: set = set()
+        
+        self._api_key = None
+        self._api_secret = None
+        self._api_passphrase = None
+        
         print("   Connected to Polymarket CLOB")
+        
+        self._start_ws()
     
     def get_nonce(self) -> int:
         with self._nonce_lock:
@@ -309,6 +321,81 @@ class RealTradingClient(TradingClient):
         except Exception:
             pass
         return []
+    
+    def _start_ws(self):
+        try:
+            from websocket import WebSocketApp
+            import json
+            
+            self._api_key, self._api_secret, self._api_passphrase = self.client.derive_api_key()
+            
+            self._ws_url = "wss://ws-subscriptions-clob.polymarket.com"
+            self._ws_running = True
+            
+            def on_message(ws, message):
+                try:
+                    data = json.loads(message)
+                    if data.get("type") == "order_filled" and self.fill_callback:
+                        self.fill_callback(data)
+                    elif data.get("type") == "trade" and self.fill_callback:
+                        self.fill_callback(data)
+                except Exception:
+                    pass
+            
+            def on_error(ws, error):
+                pass
+            
+            def on_close(ws, status, msg):
+                self._ws_running = False
+            
+            def on_open(ws):
+                auth = {"apiKey": self._api_key, "secret": self._api_secret, "passphrase": self._api_passphrase}
+                ws.send(json.dumps({"type": "user", "auth": auth}))
+                
+                def ping():
+                    while self._ws_running:
+                        try:
+                            ws.send("PING")
+                        except Exception:
+                            break
+                        time.sleep(10)
+                
+                threading.Thread(target=ping, daemon=True).start()
+            
+            self._ws = WebSocketApp(
+                self._ws_url + "/ws/user",
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close,
+                on_open=on_open,
+            )
+            
+            self._ws_thread = threading.Thread(target=self._ws.run_forever, daemon=True)
+            self._ws_thread.start()
+            
+        except Exception as e:
+            pass
+    
+    def subscribe_token(self, token_id: str):
+        if token_id not in self._subscribed_tokens and self._ws:
+            self._subscribed_tokens.add(token_id)
+            try:
+                import json
+                self._ws.send(json.dumps({
+                    "type": "subscribe",
+                    "assets_ids": [token_id],
+                    "operation": "subscribe"
+                }))
+            except Exception:
+                pass
+    
+    def stop_ws(self):
+        self._ws_running = False
+        if self._ws:
+            try:
+                self._ws.close()
+            except Exception:
+                pass
 
 
 class SandboxTradingClient(TradingClient):
@@ -398,6 +485,20 @@ class OrderManager:
         self.cancelled_count = 0
         self.gas_spent = 0.0
         self.gas_lock = threading.Lock()
+        
+        self._ws_fills: List[Dict] = []
+        self._ws_fills_lock = threading.Lock()
+        
+        self._setup_ws_callback()
+    
+    def _setup_ws_callback(self):
+        if hasattr(self.client, 'fill_callback') and self.client.fill_callback:
+            pass
+        elif hasattr(self.client, 'subscribe_token'):
+            def on_fill(data):
+                with self._ws_fills_lock:
+                    self._ws_fills.append(data)
+            self.client.fill_callback = on_fill
     
     def calc_fill_prob(self, order: Order, book: OrderBook, volume: float, size_usd: float) -> float:
         if book.bids and book.asks:
@@ -491,21 +592,46 @@ class OrderManager:
                     self.filled_count += 1
                     self.inventory[order.market_id]["YES" if order.side == OrderSide.BUY else "NO"] += order.size
             else:
-                for trade in self.client.get_recent_trades(order.token_id, 20):
-                    if self._trade_matches(trade, order):
-                        fills.append({
-                            "order_id": oid,
-                            "side": order.side.value,
-                            "filled_qty": float(trade.get("size", 0)),
-                            "filled_price": float(trade.get("price", order.price)),
-                            "rebate": self._calc_rebate(float(trade.get("size", 0)), 
-                                                         float(trade.get("price", order.price)), market.fee_bps),
-                        })
-                        self.filled.append(order)
-                        self.open.pop(oid)
-                        self.filled_count += 1
-                        self.inventory[order.market_id]["YES" if order.side == OrderSide.BUY else "NO"] += order.size
-                        break
+                ws_fills_processed = False
+                with self._ws_fills_lock:
+                    for fill_data in self._ws_fills[:]:
+                        order_id = fill_data.get("order_id") or fill_data.get("orderId")
+                        if order_id and order_id in self.open:
+                            order = self.open[order_id]
+                            fills.append({
+                                "order_id": order_id,
+                                "side": order.side.value,
+                                "filled_qty": float(fill_data.get("size", order.size)),
+                                "filled_price": float(fill_data.get("price", order.price)),
+                                "rebate": self._calc_rebate(float(fill_data.get("size", order.size)),
+                                                             float(fill_data.get("price", order.price)), market.fee_bps),
+                            })
+                            order.filled_qty = float(fill_data.get("size", order.size))
+                            order.filled_price = float(fill_data.get("price", order.price))
+                            order.status = OrderStatus.FILLED
+                            self.filled.append(order)
+                            self.open.pop(order_id)
+                            self.filled_count += 1
+                            self.inventory[order.market_id]["YES" if order.side == OrderSide.BUY else "NO"] += order.size
+                            self._ws_fills.remove(fill_data)
+                            ws_fills_processed = True
+                
+                if not ws_fills_processed:
+                    for trade in self.client.get_recent_trades(order.token_id, 20):
+                        if self._trade_matches(trade, order):
+                            fills.append({
+                                "order_id": oid,
+                                "side": order.side.value,
+                                "filled_qty": float(trade.get("size", 0)),
+                                "filled_price": float(trade.get("price", order.price)),
+                                "rebate": self._calc_rebate(float(trade.get("size", 0)), 
+                                                             float(trade.get("price", order.price)), market.fee_bps),
+                            })
+                            self.filled.append(order)
+                            self.open.pop(oid)
+                            self.filled_count += 1
+                            self.inventory[order.market_id]["YES" if order.side == OrderSide.BUY else "NO"] += order.size
+                            break
         
         return fills
     
@@ -635,12 +761,16 @@ def main():
                     if o:
                         open_orders[mkt.condition_id]["BUY"] = o.order_id
                         print(f"  BUY {token_qty:.2f} @ {buy_p:.4f}")
+                        if hasattr(client, 'subscribe_token'):
+                            client.subscribe_token(mkt.tokens[0])
                 
                 if not open_orders[mkt.condition_id]["SELL"] and no_v + order_size_usd <= max_inv_usd:
                     o = mgr.submit_order(mkt, OrderSide.SELL, sell_p, token_qty, fee, lifetime)
                     if o:
                         open_orders[mkt.condition_id]["SELL"] = o.order_id
                         print(f"  SELL {token_qty:.2f} @ {sell_p:.4f}")
+                        if hasattr(client, 'subscribe_token'):
+                            client.subscribe_token(mkt.tokens[1])
             
             if cycle % 5 == 0:
                 rate = mgr.filled_count / mgr.placed * 100 if mgr.placed > 0 else 0
@@ -652,6 +782,8 @@ def main():
             time.sleep(3)
     
     except KeyboardInterrupt:
+        if hasattr(client, 'stop_ws'):
+            client.stop_ws()
         pass
     
     total_rebates = sum(o.filled_qty * o.filled_price * 156 / 10000 * MAKER_REBATE_RATE for o in mgr.filled)
