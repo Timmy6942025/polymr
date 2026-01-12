@@ -1,60 +1,49 @@
-# Polymarket Maker Rebates Bot
+# Polymr - DeFi & Prediction Market Income Platform
 
-A production-ready automated market-making bot for Polymarket's CLOB (Central Limit Order Book) designed to generate **passive income through maker rebates**.
+A unified platform for **passive income** through DeFi yield farming and **Polymarket maker rebates**.
 
-## 🎯 Purpose
+## 🎯 Two Income Streams
 
-This bot automatically provides liquidity to Polymarket's 15-minute crypto markets by placing maker (limit) orders, earning **daily USDC rebates** on filled orders.
+### 1. DeFi Yield Farming (Frontend)
+- Stake ETH → Earn 3.5% APY (Lido)
+- Lend USDC → Earn 5-9% APY (Aave, Compound, Ledn)
+- Solana staking → Earn 7% APY (Marinade)
+- Real-world assets → Earn 10.5% APY (Centrifuge)
 
-## 📊 Key Features
+### 2. Polymarket Maker Rebates (Backend)
+- Provide liquidity to 15-minute crypto markets
+- Earn **100% rebate** on taker fees (limited time)
+- Daily USDC payouts
+- Fully automated trading bot
 
-### Core Functionality
-- **Real-time market making** on Polymarket CLOB
-- **15-minute crypto market discovery** - automatically finds eligible markets
-- **Passive order execution** - maker orders only to earn rebates
-- **Inventory management** - balanced YES/NO exposure control
-- **Risk management** - exposure limits, position caps, and validation
-
-### Performance & Efficiency
-- **Low-latency cancel/replace cycles** - optimized for 500ms taker delay
-- **Gas batching** - minimizes Polygon transaction costs
-- **WebSocket real-time updates** - instant orderbook tracking
-- **Queue positioning** - optimized order placement for fills
-
-### Monitoring & Control
-- **Prometheus metrics** - real-time performance monitoring
-- **Structured JSON logging** - full audit trail
-- **Auto-redeem** - automatic settlement processing
-- **Configurable via .env** - easy parameter tuning
-
-## 💰 Revenue Model
-
-### Maker Rebates Program
-- **Target Markets**: 15-minute crypto markets only
-- **Current Rebate Rate**: 100% (Jan 9-11, 2026), then 20%
-- **Payout Frequency**: Daily in USDC
-- **Max Fee Rate**: 1.56% at 50% probability
-
-### How It Works
-1. Place limit orders (maker) that provide liquidity
-2. Orders get filled by other traders (takers)
-3. Earn rebates on taker fees collected
-4. Receive daily USDC payouts
+---
 
 ## 🚀 Quick Start
 
-### 1. Requirements
-- Python 3.11+
-- Ethereum private key with USDC on Polygon
-- Polymarket account
-
-### 2. Installation
+### Frontend (DeFi Dashboard)
 
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/polymr.git
-cd polymr
+cd /home/timmy/polymr
 
+# Install dependencies
+npm install
+
+# Start development server
+npm run dev
+
+# Open http://localhost:5173
+```
+
+**Features:**
+- MetaMask wallet connection
+- Browse 6 DeFi protocols with real-time APY
+- Portfolio tracking with local storage
+- Yield calculator for estimated earnings
+- Risk filtering (Low Risk, Stake, Lend)
+
+### Backend (Polymarket Bot)
+
+```bash
 # Create virtual environment
 python -m venv .venv
 source .venv/bin/activate  # Linux/Mac
@@ -62,195 +51,176 @@ source .venv/bin/activate  # Linux/Mac
 
 # Install dependencies
 pip install -r requirements.txt
-```
 
-### 3. Configuration
-
-```bash
-# Copy environment file
+# Configure environment
 cp .env.example .env
+# Edit .env with your PRIVATE_KEY and PUBLIC_ADDRESS
 
-# Edit with your credentials
-nano .env
+# Run in test mode
+python -m polymr.main
+
+# For production, set TEST_MODE=false in .env
 ```
 
-Required configuration:
-```env
-PRIVATE_KEY=your_private_key_here
-PUBLIC_ADDRESS=your_wallet_address_here
-RPC_URL=https://polygon-rpc.com
+---
 
-# Start with small values
+## 💰 How to Profit
+
+### DeFi Yield Farming
+
+| Protocol | Type | APY | Risk |
+|----------|------|-----|------|
+| Lido | ETH Staking | 3.5% | 🛡️ Low |
+| Marinade | SOL Staking | 7.0% | 🛡️ Low |
+| Aave | USDC Lending | 5.2% | 🛡️ Low |
+| Compound | USDC Lending | 4.8% | 🛡️ Low |
+| Centrifuge | RWA | 10.5% | ⚠️ Medium |
+| Ledn | USDC Lending | 9.2% | ⚠️ Medium |
+
+**Steps:**
+1. Connect MetaMask wallet
+2. Select a protocol
+3. Deposit tokens
+4. Track earnings in Portfolio
+
+### Polymarket Maker Rebates
+
+**Revenue Model:**
+- Place maker (limit) orders on 15-minute crypto markets
+- When takers fill your orders, you earn rebates on their fees
+- **Current rebate rate: 100%** (limited time offer)
+- Daily USDC payouts to your wallet
+
+**Bot Configuration:**
+```env
+# In .env file
+PRIVATE_KEY=your_private_key        # From MetaMask
+PUBLIC_ADDRESS=your_address         # Your wallet address
+RPC_URL=https://polygon-rpc.com     # Polygon RPC
+
+# Start small
 DEFAULT_SIZE=10.0
 MAX_EXPOSURE_USD=1000.0
-TEST_MODE=true
+
+# Enable for production
+TEST_MODE=false
 ```
 
-### 4. Run the Bot
-
-```bash
-# Test mode (dry run, no real trades)
-python -m polymr.main
-
-# Production mode
-# Set TEST_MODE=false in .env first
-python -m polymr.main
-```
+---
 
 ## 📁 Project Structure
 
 ```
 polymr/
-├── polymr/
-│   ├── __init__.py
-│   ├── main.py                 # Entry point and orchestrator
-│   ├── config.py               # Configuration management
-│   ├── polymarket/
-│   │   ├── __init__.py
-│   │   ├── rest_client.py      # REST API client
-│   │   ├── websocket_client.py # WebSocket client
-│   │   ├── order_signer.py     # Order signing utilities
-│   │   └── auth.py             # Authentication
-│   ├── quoting/
-│   │   ├── __init__.py
-│   │   ├── quote_engine.py     # Quote generation
-│   │   └── spread_calculator.py # Spread calculation
-│   ├── inventory/
-│   │   ├── __init__.py
-│   │   └── inventory_manager.py # Position management
-│   ├── execution/
-│   │   ├── __init__.py
-│   │   └── order_executor.py   # Order placement/cancellation
-│   ├── risk/
-│   │   ├── __init__.py
-│   │   └── risk_manager.py     # Risk validation
-│   ├── services/
-│   │   ├── __init__.py
-│   │   ├── auto_redeem.py      # Settlement processing
-│   │   └── market_discovery.py # Market discovery
-│   └── monitoring/
-│       ├── __init__.py
-│       ├── metrics.py          # Prometheus metrics
-│       └── logging.py          # Structured logging
-├── config.yaml                 # Main configuration
-├── .env.example               # Environment template
-├── requirements.txt           # Dependencies
-├── pyproject.toml            # Project metadata
-└── README.md                 # This file
+├── src/                          # React Frontend
+│   ├── main.tsx                  # Entry point
+│   ├── App.tsx                   # Main app with wallet connection
+│   ├── types.ts                  # TypeScript interfaces
+│   ├── store.ts                  # Zustand state + PROTOCOLS data
+│   ├── index.css                 # Tailwind styles
+│   ├── hooks/
+│   │   ├── useWallet.ts          # MetaMask connection
+│   │   └── useProtocols.ts       # Protocol filtering
+│   └── components/
+│       ├── ProtocolCard.tsx      # Protocol display
+│       ├── WalletButton.tsx      # Connect/disconnect
+│       ├── DepositModal.tsx      # Yield calculator
+│       └── Portfolio.tsx         # Positions dashboard
+│
+├── polymr/                       # Python Backend
+│   ├── main.py                   # Bot orchestrator
+│   ├── config.py                 # Configuration management
+│   ├── polymarket/               # API clients
+│   │   ├── rest_client.py        # REST API
+│   │   └── websocket_client.py   # WebSocket
+│   ├── quoting/                  # Quote engine
+│   ├── execution/                # Order executor
+│   ├── risk/                     # Risk management
+│   └── monitoring/               # Metrics
+│
+├── config.yaml                   # Bot configuration
+├── .env.example                  # Environment template
+├── requirements.txt              # Python dependencies
+├── package.json                  # Node dependencies
+└── README.md                     # This file
 ```
 
-## ⚙️ Configuration Guide
+---
 
-### Quoting Parameters
+## ⚙️ Configuration
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `DEFAULT_SIZE` | 10.0 | Base order size in USD |
-| `MIN_SPREAD_BPS` | 10 | Minimum spread (0.10%) |
-| `MAX_SPREAD_BPS` | 50 | Maximum spread (0.50%) |
-| `QUOTE_REFRESH_RATE_MS` | 1000 | Quote update frequency |
+### Frontend
+No configuration required. Runs out of the box.
 
-### Risk Parameters
+### Backend (config.yaml)
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `MAX_EXPOSURE_USD` | 1000.0 | Max net exposure in either direction |
-| `STOP_LOSS_PCT` | 10.0 | Stop loss percentage |
-| `MAX_SINGLE_ORDER_SIZE` | 100.0 | Max single order size |
+```yaml
+quoting:
+  default_size: 10.0          # Order size in USD
+  min_spread_bps: 10          # 0.10% minimum spread
+  max_spread_bps: 50          # 0.50% maximum spread
 
-### Optimization Tips
+inventory:
+  max_exposure_usd: 1000.0    # Maximum position size
+  max_inventory_skew: 0.3     # 30% max imbalance
 
-**For Higher Fill Rates:**
-- Reduce `MIN_SPREAD_BPS` to 5-10 bps
-- Increase `DEFAULT_SIZE` to 20-50
-- Decrease `QUOTE_REFRESH_RATE_MS` to 500
+risk:
+  stop_loss_pct: 10.0         # Stop loss percentage
+  pre_trade_validation: true  # Validate before trading
 
-**For Lower Risk:**
-- Reduce `MAX_EXPOSURE_USD` to 500
-- Increase `MIN_SPREAD_BPS` to 20-30
-- Enable `STOP_LOSS_PCT` at 5%
+bot:
+  test_mode: true             # Set to false for production
+```
 
-**For Gas Savings:**
-- Enable `GAS_BATCHING_ENABLED=true`
-- Increase `QUOTE_REFRESH_RATE_MS` to 2000
-- Set `BATCH_CANCELLATIONS=true`
+---
 
-## 📈 Expected Performance
+## 🔒 Security
 
-Based on market conditions and configuration:
+- Never share your PRIVATE_KEY
+- Start with TEST_MODE=true
+- Use a dedicated wallet with limited funds
+- Monitor your positions regularly
+- Comply with Polymarket terms of service
 
-| Metric | Expected Range |
-|--------|----------------|
-| Fill Rate | 60-80% passive fills |
-| Inventory Skew | <30% maintained |
-| Quote Latency | <100ms |
-| Daily Rebate Yield | 0.5-2% of volume |
-
-## 🔒 Safety & Risk
-
-### Important Warnings
-⚠️ **Market making involves capital risk**
-- Test thoroughly with small amounts first
-- Monitor exposure and inventory continuously
-- Gas costs can be significant during high network activity
-
-### Best Practices
-1. Start with `TEST_MODE=true` to verify configuration
-2. Begin with small `DEFAULT_SIZE` and `MAX_EXPOSURE_USD`
-3. Monitor logs for risk check failures
-4. Review trading activity regularly
-5. Comply with Polymarket terms of service
+---
 
 ## 📊 Monitoring
 
 ### Prometheus Metrics
 Access at `http://localhost:9305/metrics`:
-- `polymr_orders_placed_total` - Total orders by side/outcome
-- `polymr_orders_filled_total` - Total passive fills
-- `polymr_inventory` - Current YES/NO positions
-- `polymr_exposure_usd` - Net exposure in USD
-- `polymr_rebates_earned_usd` - Cumulative rebates
-- `polymr_quote_latency_ms` - Quote generation latency
+- `polymr_orders_placed_total` - Total orders placed
+- `polymr_orders_filled_total` - Total fills (rebates earned)
+- `polymr_rebates_earned_usd` - Cumulative rebates in USDC
 
-### Structured Logging
-All events logged as JSON with:
-- Timestamp and log level
-- Event type and details
-- Correlation IDs for tracing
-
-## 🐳 Docker Deployment
-
-```bash
-# Build and run
-docker compose up --build -d
-
-# View logs
-docker compose logs -f polymr-bot
-
-# Stop
-docker compose down
-```
-
-## 📝 License
-
-MIT License - See LICENSE file for details.
-
-## 🤝 Contributing
-
-Contributions welcome! Please read contributing guidelines first.
-
-## 📞 Support
-
-- GitHub Issues: For bug reports and feature requests
-- Documentation: See docs/ directory
-- Telegram: Community support channel
-
-## 🙏 Acknowledgments
-
-- Polymarket team for the CLOB infrastructure
-- Open-source market making implementations
-- The prediction market community
+### Logs
+Structured JSON logging with full audit trail.
 
 ---
 
-**Disclaimer**: This software is experimental. Use at your own risk. Past performance does not guarantee future results. Always test thoroughly before deploying with real funds.
+## 🛠️ Development
+
+### Run Frontend
+```bash
+npm run dev          # Development server
+npm run build        # Production build
+npm run preview      # Preview production build
+```
+
+### Run Backend
+```bash
+python -m polymr.main                    # Run bot
+python -m polymr.main --config config.yaml  # Custom config
+```
+
+---
+
+## ⚠️ Disclaimer
+
+This software is experimental. Use at your own risk. Past performance does not guarantee future results. Always:
+- Test thoroughly with small amounts
+- Understand the risks of DeFi and market making
+- Never invest more than you can afford to lose
+
+---
+
+**Start earning passive income today! 🚀**
