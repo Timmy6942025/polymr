@@ -1,36 +1,29 @@
 #!/usr/bin/env python3
 """
-Polymr - Market Making Bot (FULLY REALISTIC Implementation)
+Polymr - Market Making Bot
 
-Properly models:
-- Order lifecycle with ID tracking (submit → open → filled/cancelled)
-- Token-based inventory (YES/NO token quantities, not USD)
-- Real gas costs (only on actual on-chain operations)
-- Actual Polymarket fee structure (100% maker rebate on eligible markets)
-- Market expiration handling (15-minute crypto markets only)
-- Order persistence with proper tracking
-- Realistic fill determination from orderbook queue position
-- Asymmetric skew penalties for proper rebalancing
-- Volatility derived from actual market data
+Real trading via py_clob_client or realistic sandbox simulation.
 
-Usage:
-    python run_bot.py [capital] [aggro] [--sandbox|--real]
+Usage: python run_bot.py [capital] [aggro] [--sandbox|--real]
+
+Real mode requires: POLYMARKET_PRIVATE_KEY and POLYMARKET_FUNDER env vars.
 """
 
 import os
 import sys
 import time
 import random
+import threading
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import defaultdict
+from dataclasses import dataclass
+from typing import Optional, Dict, List, Any
+from enum import Enum
+from abc import ABC, abstractmethod
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
 
 AGGRO = {
     "1": {"name": "Conservative", "pct": 0.10, "min_bps": 15, "max_bps": 50, "inventory_cap": 0.15, "order_lifetime_s": 120},
@@ -38,215 +31,514 @@ AGGRO = {
     "3": {"name": "Aggressive", "pct": 0.30, "min_bps": 3, "max_bps": 20, "inventory_cap": 0.40, "order_lifetime_s": 30},
 }
 
-# Gas costs on Polygon (realistic values - research shows $0.05-$0.20)
-GAS_PLACE_MATIC = 0.05  # ~$0.05-$0.10
-GAS_CANCEL_MATIC = 0.03  # ~$0.03-$0.06
-MATIC_TO_USD = 0.80
-
-# Maker rebate rate (varies by promo period, currently 20-100%)
-MAKER_REBATE_RATE = 0.20  # Current rate (Jan 12-18, 2026 promo period)
-
-# Market requirements
+DEFAULT_GAS_PRICE_GWEI = 30
 MIN_VOLUME_USD = 5000
 MIN_FEE_BPS = 50
-MAX_PER_MARKET_PCT = 0.30  # Max 30% of capital in any single market
-MAX_NET_EXPOSURE_PCT = 0.50  # Max 50% directional exposure
+MAX_PER_MARKET_PCT = 0.30
+MAX_NET_EXPOSURE_PCT = 0.50
+MAKER_REBATE_RATE = 0.20
 
 
-# ============================================================================
-# ORDER MANAGEMENT
-# ============================================================================
+class OrderSide(Enum):
+    BUY = "BUY"
+    SELL = "SELL"
 
-class OrderManager:
+class OrderStatus(Enum):
+    PENDING = "pending"
+    OPEN = "open"
+    FILLED = "filled"
+    CANCELLED = "cancelled"
+    EXPIRED = "expired"
+
+
+@dataclass
+class Order:
+    order_id: str
+    market_id: str
+    token_id: str
+    side: OrderSide
+    price: float
+    size: float
+    status: OrderStatus
+    created_at: float
+    expires_at: float
+    nonce: int
+    filled_qty: float = 0.0
+    filled_price: float = 0.0
+
+
+@dataclass
+class Market:
+    condition_id: str
+    question: str
+    tokens: List[str]
+    fee_bps: int
+    volume_24h: float
+    start_time: str
+    end_time: str
+
+
+@dataclass
+class OrderBook:
+    bids: List[Dict]
+    asks: List[Dict]
+    midpoint: float = 0.5
+    spread_bps: float = 0.0
+
+
+class TradingClient(ABC):
+    @abstractmethod
+    def get_markets(self) -> List[Market]: pass
+    @abstractmethod
+    def get_orderbook(self, token_id: str) -> OrderBook: pass
+    @abstractmethod
+    def get_fee_rate(self, token_id: str) -> int: pass
+    @abstractmethod
+    def submit_order(self, order: Order, fee_rate_bps: int) -> Dict: pass
+    @abstractmethod
+    def cancel_order(self, order_id: str) -> bool: pass
+    @abstractmethod
+    def get_open_orders(self, market_id: Optional[str] = None) -> List[Order]: pass
+    @abstractmethod
+    def get_gas_price(self) -> float: pass
+    @abstractmethod
+    def get_nonce(self) -> int: pass
+    @abstractmethod
+    def get_recent_trades(self, token_id: str, limit: int = 50) -> List[Dict]: pass
+
+
+class RealTradingClient(TradingClient):
     def __init__(self):
-        self.open_orders = {}  # {order_id: {"side": str, "price": float, "size": float, "token": str, "created": float, "market_id": str}}
-        self.order_counter = 0
-        self.filled_orders = defaultdict(list)  # {market_id: [{"price": float, "size": float, "side": str}]}
-        self.cancelled_count = 0
-        self.expired_count = 0
-    
-    def submit_order(self, side: str, price: float, size: float, token: str, market_id: str) -> str:
-        self.order_counter += 1
-        order_id = f"ord_{self.order_counter}_{int(time.time()*1000)}"
-        self.open_orders[order_id] = {
-            "side": side,
-            "price": price,
-            "size": size,
-            "token": token,
-            "created": time.time(),
-            "market_id": market_id,
-        }
-        return order_id
-    
-    def cancel_order(self, order_id: str):
-        if order_id in self.open_orders:
-            del self.open_orders[order_id]
-            self.cancelled_count += 1
-    
-    def cancel_stale_orders(self, max_age_seconds: int) -> int:
-        now = time.time()
-        stale = [oid for oid, o in self.open_orders.items() if now - o["created"] > max_age_seconds]
-        for oid in stale:
-            self.cancel_order(oid)
-            self.expired_count += 1
-        return len(stale)
-    
-    def check_fills_from_orderbook(self, orderbook: dict, market_id: str) -> list:
-        fills = []
-        bids = orderbook.get("bids", [])
-        asks = orderbook.get("asks", [])
+        self.host = "https://clob.polymarket.com"
+        self.chain_id = 137
         
-        for order_id, order in list(self.open_orders.items()):
-            if order["market_id"] != market_id:
-                continue
-            
-            if order["side"] == "BUY":
-                for ask in asks:
-                    if order["price"] >= ask.get("price", 0) and ask.get("size", 0) > 0:
-                        fill_qty = min(order["size"], ask["size"])
-                        if fill_qty > 0:
-                            fills.append({
-                                "order_id": order_id,
-                                "side": "BUY",
-                                "filled_price": ask["price"],
-                                "filled_qty": fill_qty
-                            })
-                        break
-            
-            elif order["side"] == "SELL":
-                for bid in bids:
-                    if order["price"] <= bid.get("price", 0) and bid.get("size", 0) > 0:
-                        fill_qty = min(order["size"], bid["size"])
-                        if fill_qty > 0:
-                            fills.append({
-                                "order_id": order_id,
-                                "side": "SELL",
-                                "filled_price": bid["price"],
-                                "filled_qty": fill_qty
-                            })
-                        break
+        private_key = os.environ.get("POLYMARKET_PRIVATE_KEY")
+        funder = os.environ.get("POLYMARKET_FUNDER")
         
-        return fills
-
-
-# ============================================================================
-# MARKET DATA
-# ============================================================================
-
-def fetch_real_markets():
-    """Fetch active 15-minute crypto markets from Polymarket."""
-    try:
+        if not private_key or not funder:
+            raise ValueError("Set POLYMARKET_PRIVATE_KEY and POLYMARKET_FUNDER env vars.")
+        
+        from py_clob_client.client import ClobClient
+        self.client = ClobClient(
+            self.host, key=private_key, chain_id=self.chain_id,
+            signature_type=1, funder=funder,
+        )
+        self.client.set_api_creds(self.client.create_or_derive_api_creds())
+        
+        self._nonce = 0
+        self._nonce_lock = threading.Lock()
+        self._fee_cache: Dict[str, int] = {}
+        self._fee_cache_time: Dict[str, float] = {}
+        
+        print("   Connected to Polymarket CLOB")
+    
+    def get_nonce(self) -> int:
+        with self._nonce_lock:
+            n = self._nonce
+            self._nonce += 1
+        return n
+    
+    def _get_cached_fee(self, token_id: str) -> Optional[int]:
+        if token_id in self._fee_cache:
+            if time.time() - self._fee_cache_time[token_id] < 300:
+                return self._fee_cache[token_id]
+        return None
+    
+    def _cache_fee(self, token_id: str, fee_bps: int):
+        self._fee_cache[token_id] = fee_bps
+        self._fee_cache_time[token_id] = time.time()
+    
+    def get_markets(self) -> List[Market]:
         import httpx
-        base = "https://clob.polymarket.com"
+        markets = []
         client = httpx.Client(timeout=10.0)
         
-        r = client.get(f"{base}/markets", params={"limit": 100, "active": "true"})
-        if r.status_code != 200:
+        try:
+            r = client.get(
+                "https://gamma-api.polymarket.com/events",
+                params={"status": "active", "limit": 100}
+            )
+            if r.status_code != 200:
+                return []
+            
+            data = r.json()
+            for event in data.get("events", []):
+                if not event.get("markets"):
+                    continue
+                
+                market_data = event["markets"][0]
+                question = event.get("question", "").lower()
+                tags = [t.lower() for t in event.get("tags", [])]
+                volume = event.get("volume") or 0
+                
+                crypto_kw = ["btc", "bitcoin", "eth", "ethereum", "sol", "solana", "crypto"]
+                if not any(kw in question or kw in tags for kw in crypto_kw):
+                    continue
+                if volume < MIN_VOLUME_USD:
+                    continue
+                if not any(t in tags for t in ["15-min", "15m", "15 minute"]):
+                    continue
+                
+                token_ids = market_data.get("tokens") or []
+                if len(token_ids) < 2:
+                    continue
+                
+                markets.append(Market(
+                    condition_id=event.get("condition_id", ""),
+                    question=event.get("question", "")[:100],
+                    tokens=token_ids,
+                    fee_bps=0,
+                    volume_24h=volume,
+                    start_time=event.get("startDate", ""),
+                    end_time=event.get("endDate", ""),
+                ))
+        except Exception as e:
+            print(f"   Market fetch error: {e}")
+        finally:
+            client.close()
+        
+        return markets
+    
+    def get_orderbook(self, token_id: str) -> OrderBook:
+        try:
+            ob = self.client.get_order_book(token_id)
+            bids = [{"price": float(b.price), "size": float(b.size)} for b in ob.bids[:20]]
+            asks = [{"price": float(a.price), "size": float(a.size)} for a in ob.asks[:20]]
+            
+            if bids and asks:
+                mid = (bids[0]["price"] + asks[0]["price"]) / 2
+                spread = (asks[0]["price"] - bids[0]["price"]) / mid * 10000
+            else:
+                mid, spread = 0.5, 0
+            
+            return OrderBook(bids=bids, asks=asks, midpoint=mid, spread_bps=spread)
+        except Exception:
+            return OrderBook(bids=[], asks=[])
+    
+    def get_fee_rate(self, token_id: str) -> int:
+        cached = self._get_cached_fee(token_id)
+        if cached is not None:
+            return cached
+        try:
+            fee = self.client.get_fee_rate_bps(token_id)
+            self._cache_fee(token_id, fee)
+            return fee
+        except Exception:
+            return 0
+    
+    def submit_order(self, order: Order, fee_rate_bps: int) -> Dict:
+        from py_clob_client.clob_types import OrderArgs, OrderType
+        
+        api_args = {
+            "token_id": order.token_id,
+            "price": order.price,
+            "size": order.size,
+            "side": order.side.value,
+            "fee_rate_bps": fee_rate_bps,
+            "nonce": order.nonce,
+            "expiration": int(order.expires_at),
+            "taker": "0x0000000000000000000000000000000000000000",
+        }
+        
+        order_args = OrderArgs(**api_args)
+        signed = self.client.create_order(order_args)
+        response = self.client.post_order(signed, OrderType.GTC)
+        
+        return response
+    
+    def cancel_order(self, order_id: str) -> bool:
+        try:
+            return self.client.cancel(order_id).get("status") == "success"
+        except Exception:
+            return False
+    
+    def get_open_orders(self, market_id: Optional[str] = None) -> List[Order]:
+        from py_clob_client.clob_types import OpenOrderParams
+        
+        try:
+            params = OpenOrderParams(market=market_id) if market_id else OpenOrderParams()
+            orders = self.client.get_orders(params)
+            
+            result = []
+            for o in orders:
+                side = OrderSide.BUY if o.get("side", 0) == 0 else OrderSide.SELL
+                result.append(Order(
+                    order_id=o.get("id", ""),
+                    market_id=o.get("market", ""),
+                    token_id=o.get("token_id", ""),
+                    side=side,
+                    price=float(o.get("price", 0)),
+                    size=float(o.get("size", 0)),
+                    status=OrderStatus.OPEN,
+                    created_at=o.get("created_at", time.time()),
+                    expires_at=o.get("expiration", time.time() + 86400),
+                    nonce=o.get("nonce", 0),
+                ))
+            return result
+        except Exception:
             return []
-        
-        data = r.json()
-        markets = data.get("data", []) if isinstance(data, dict) else []
-        client.close()
-        
-        crypto_keywords = ["btc", "bitcoin", "eth", "ethereum", "sol", "solana", "crypto", "binance"]
-        eligible = []
-        
-        for m in markets:
-            question = m.get("question", "").lower()
-            tags = [t.lower() for t in (m.get("tags") or [])]
-            vol = m.get("volume_24h", 0)
-            
-            # Check if crypto-related
-            is_crypto = any(kw in question or kw in tags for kw in crypto_keywords)
-            if not is_crypto:
-                continue
-            
-            # Check volume
-            if vol < MIN_VOLUME_USD:
-                continue
-            
-            # Get fee rate
-            tids = m.get("token_ids") or []
-            if len(tids) < 2:
-                continue
-            
-            try:
-                r2 = client.get(f"{base}/fee-rate", params={"token_id": tids[0]})
-                fee = r2.json().get("fee_rate_bps", 0)
-            except:
-                fee = 0
-            
-            if fee < MIN_FEE_BPS:
-                continue
-            
-            # Check if it's a short-duration market (15-min)
-            # Polymarket uses "duration" tag or we infer from start/end times
-            start_time = m.get("start_time", "")
-            end_time = m.get("end_time", "")
-            
-            # Accept markets with "15-min" or "short" in tags
-            is_short_duration = any(t in tags for t in ["15-min", "short-term", "minutes"])
-            
-            # If we can't determine duration, check volume pattern
-            # Short markets typically have consistent volume
-            if not is_short_duration:
-                # Accept it if volume is high enough and it's clearly crypto
-                if vol > 10000:
-                    is_short_duration = True
-            
-            if is_short_duration:
-                eligible.append({
-                    "id": m.get("condition_id"),
-                    "question": m.get("question", "")[:50],
-                    "tokens": tids,
-                    "fee_bps": fee,
-                    "volume_24h": vol,
-                    "start_time": start_time,
-                    "end_time": end_time,
-                })
-        
-        return eligible
-        
-    except Exception as e:
-        print(f"   ⚠️  Market fetch error: {e}")
+    
+    def get_gas_price(self) -> float:
+        import httpx
+        try:
+            client = httpx.Client(timeout=5.0)
+            r = client.post(
+                "https://polygon-rpc.com",
+                json={"jsonrpc": "2.0", "method": "eth_gasPrice", "params": [], "id": 1}
+            )
+            if r.status_code == 200:
+                result = r.json().get("result", "0x0")
+                gas_wei = int(result, 16) if result.startswith("0x") else int(result)
+                client.close()
+                return gas_wei / 1e9
+            client.close()
+        except Exception:
+            pass
+        return DEFAULT_GAS_PRICE_GWEI
+    
+    def get_recent_trades(self, token_id: str, limit: int = 50) -> List[Dict]:
+        import httpx
+        try:
+            client = httpx.Client(timeout=5.0)
+            r = client.get(f"{self.host}/trades", params={"token_id": token_id, "limit": limit})
+            if r.status_code == 200:
+                data = r.json()
+                client.close()
+                return data.get("trades", [])
+            client.close()
+        except Exception:
+            pass
         return []
 
 
-def calculate_volatility_from_orderbook(orderbook: dict) -> dict:
-    """Calculate volatility metrics from orderbook."""
-    bids = orderbook.get("bids", [])
-    asks = orderbook.get("asks", [])
+class SandboxTradingClient(TradingClient):
+    def __init__(self):
+        self._nonce = 0
+        self._nonce_lock = threading.Lock()
+        self._order_counter = 0
+        self._simulated_books: Dict[str, OrderBook] = {}
+        print("   Sandbox mode initialized")
     
-    if not bids or not asks:
-        return {"mode": "normal", "fill_boost": 1.0, "spread_mult": 1.0}
+    def get_nonce(self) -> int:
+        with self._nonce_lock:
+            n = self._nonce
+            self._nonce += 1
+        return n
     
-    best_bid = bids[0].get("price", 0.50)
-    best_ask = asks[0].get("price", 0.51)
-    mid = (best_bid + best_ask) / 2
+    def _gen_order_id(self) -> str:
+        self._order_counter += 1
+        return f"ord_{self._order_counter}_{int(time.time()*1000)}_{random.randint(1000,9999)}"
     
-    # Calculate spread percentage
-    spread_pct = (best_ask - best_bid) / mid * 100
+    def _gen_orderbook(self, mid_price: float, volatility: str = "normal") -> OrderBook:
+        spread_mult = {"calm": 0.8, "normal": 1.0, "volatile": 1.5}[volatility]
+        base_spread_pct = random.uniform(0.5, 2.0) * spread_mult
+        spread_bps = base_spread_pct * 100
+        
+        bids, asks = [], []
+        for i in range(10):
+            depth = random.uniform(5, 50) * (1.0 - i * 0.08)
+            bids.append({"price": round(mid_price * (1 - (i+1) * base_spread_pct * 0.1 / 100), 4), 
+                        "size": round(depth, 2)})
+            asks.append({"price": round(mid_price * (1 + (i+1) * base_spread_pct * 0.1 / 100), 4),
+                        "size": round(depth, 2)})
+        
+        return OrderBook(bids=bids, asks=asks, midpoint=mid_price, spread_bps=spread_bps)
     
-    # Calculate depth
-    bid_depth = sum(b.get("size", 0) for b in bids[:5])
-    ask_depth = sum(a.get("size", 0) for a in asks[:5])
-    total_depth = bid_depth + ask_depth
+    def get_markets(self) -> List[Market]:
+        return [
+            Market(f"btc_{random.randint(1000,9999)}", "Will BTC > $98,000 in next 15m?",
+                   [f"0xY_btc_{random.randint(100000,999999)}", f"0xN_btc_{random.randint(100000,999999)}"],
+                   156, random.uniform(10000, 50000), "", ""),
+            Market(f"eth_{random.randint(1000,9999)}", "Will ETH > $3,200 in next 15m?",
+                   [f"0xY_eth_{random.randint(100000,999999)}", f"0xN_eth_{random.randint(100000,999999)}"],
+                   156, random.uniform(10000, 50000), "", ""),
+            Market(f"sol_{random.randint(1000,9999)}", "Will SOL > $150 in next 15m?",
+                   [f"0xY_sol_{random.randint(100000,999999)}", f"0xN_sol_{random.randint(100000,999999)}"],
+                   156, random.uniform(8000, 40000), "", ""),
+        ]
     
-    # Determine volatility
-    if spread_pct < 0.5 and total_depth > 100:
-        return {"mode": "calm", "fill_boost": 1.2, "spread_mult": 0.8}
-    elif spread_pct > 2.0 or total_depth < 30:
-        return {"mode": "volatile", "fill_boost": 0.7, "spread_mult": 1.5}
-    else:
-        return {"mode": "normal", "fill_boost": 1.0, "spread_mult": 1.0}
+    def get_orderbook(self, token_id: str) -> OrderBook:
+        if token_id not in self._simulated_books:
+            mid = random.uniform(0.40, 0.60)
+            self._simulated_books[token_id] = self._gen_orderbook(mid)
+        return self._simulated_books[token_id]
+    
+    def get_fee_rate(self, token_id: str) -> int:
+        return 156
+    
+    def submit_order(self, order: Order, fee_rate_bps: int) -> Dict:
+        return {"orderID": self._gen_order_id(), "status": "open", "success": True}
+    
+    def cancel_order(self, order_id: str) -> bool:
+        return True
+    
+    def get_open_orders(self, market_id: Optional[str] = None) -> List[Order]:
+        return []
+    
+    def get_gas_price(self) -> float:
+        return DEFAULT_GAS_PRICE_GWEI
+    
+    def get_recent_trades(self, token_id: str, limit: int = 50) -> List[Dict]:
+        return []
 
 
-# ============================================================================
-# MAIN
-# ============================================================================
+class OrderManager:
+    def __init__(self, client: TradingClient, rebate_rate: float = 0.20):
+        self.client = client
+        self.rebate_rate = rebate_rate
+        
+        self.pending: Dict[str, Order] = {}
+        self.open: Dict[str, Order] = {}
+        self.filled: List[Order] = []
+        self.cancelled: List[Order] = []
+        self.inventory: Dict[str, Dict[str, float]] = defaultdict(lambda: {"YES": 0.0, "NO": 0.0})
+        
+        self.placed = 0
+        self.filled_count = 0
+        self.cancelled_count = 0
+        self.gas_spent = 0.0
+        self.gas_lock = threading.Lock()
+    
+    def calc_fill_prob(self, order: Order, book: OrderBook, volume: float, size_usd: float) -> float:
+        if book.bids and book.asks:
+            if order.side == OrderSide.BUY:
+                depth_ahead = sum(a["size"] for a in book.asks if a["price"] <= order.price)
+            else:
+                depth_ahead = sum(b["size"] for b in book.bids if b["price"] >= order.price)
+        else:
+            depth_ahead = 0
+        
+        queue_factor = max(0.05, min(0.95, order.size / (depth_ahead + order.size + 10)))
+        vol_factor = min(1.0, volume / (size_usd * 100))
+        spread_factor = 1.2 if book.spread_bps < 50 else (0.8 if book.spread_bps > 200 else 1.0)
+        
+        prob = 0.03 * queue_factor * vol_factor * spread_factor
+        return max(0.001, min(0.20, prob))
+    
+    def submit_order(self, market: Market, side: OrderSide, price: float, size: float, 
+                     fee_rate_bps: int, expiry_secs: int = 300) -> Optional[Order]:
+        order = Order(
+            order_id="", market_id=market.condition_id,
+            token_id=market.tokens[0] if side == OrderSide.BUY else market.tokens[1],
+            side=side, price=price, size=size, status=OrderStatus.PENDING,
+            created_at=time.time(), expires_at=time.time() + expiry_secs,
+            nonce=self.client.get_nonce(),
+        )
+        
+        try:
+            resp = self.client.submit_order(order, fee_rate_bps)
+            if resp.get("success"):
+                order.order_id = resp.get("orderID", f"sim_{int(time.time()*1000)}")
+                order.status = OrderStatus.OPEN
+                self.open[order.order_id] = order
+                self.placed += 1
+                
+                if not isinstance(self.client, SandboxTradingClient):
+                    gas_usd = self.client.get_gas_price() * 0.05 * 0.80
+                    with self.gas_lock:
+                        self.gas_spent += gas_usd
+                return order
+            return None
+        except Exception as e:
+            print(f"   Order failed: {e}")
+            return None
+    
+    def cancel_order(self, order_id: str) -> bool:
+        if order_id not in self.open:
+            return False
+        try:
+            if self.client.cancel_order(order_id):
+                order = self.open.pop(order_id)
+                order.status = OrderStatus.CANCELLED
+                self.cancelled.append(order)
+                self.cancelled_count += 1
+                if not isinstance(self.client, SandboxTradingClient):
+                    gas_usd = self.client.get_gas_price() * 0.03 * 0.80
+                    with self.gas_lock:
+                        self.gas_spent += gas_usd
+                return True
+        except Exception:
+            pass
+        return False
+    
+    def check_fills(self, market: Market) -> List[Dict]:
+        fills = []
+        now = time.time()
+        
+        for oid, order in list(self.open.items()):
+            if now > order.expires_at:
+                order.status = OrderStatus.EXPIRED
+                self.open.pop(oid)
+                continue
+            
+            book = self.client.get_orderbook(order.token_id)
+            
+            if isinstance(self.client, SandboxTradingClient):
+                prob = self.calc_fill_prob(order, book, market.volume_24h, order.size * order.price)
+                if random.random() < prob:
+                    fills.append({
+                        "order_id": oid,
+                        "side": order.side.value,
+                        "filled_qty": order.size,
+                        "filled_price": order.price,
+                        "rebate": self._calc_rebate(order.size, order.price, market.fee_bps),
+                    })
+                    order.filled_qty = order.size
+                    order.filled_price = order.price
+                    order.status = OrderStatus.FILLED
+                    self.filled.append(order)
+                    self.open.pop(oid)
+                    self.filled_count += 1
+                    self.inventory[order.market_id]["YES" if order.side == OrderSide.BUY else "NO"] += order.size
+            else:
+                for trade in self.client.get_recent_trades(order.token_id, 20):
+                    if self._trade_matches(trade, order):
+                        fills.append({
+                            "order_id": oid,
+                            "side": order.side.value,
+                            "filled_qty": float(trade.get("size", 0)),
+                            "filled_price": float(trade.get("price", order.price)),
+                            "rebate": self._calc_rebate(float(trade.get("size", 0)), 
+                                                         float(trade.get("price", order.price)), market.fee_bps),
+                        })
+                        self.filled.append(order)
+                        self.open.pop(oid)
+                        self.filled_count += 1
+                        self.inventory[order.market_id]["YES" if order.side == OrderSide.BUY else "NO"] += order.size
+                        break
+        
+        return fills
+    
+    def _trade_matches(self, trade: Dict, order: Order) -> bool:
+        trade_side = trade.get("side", "")
+        if order.side == OrderSide.BUY and trade_side != "SELL":
+            return False
+        if order.side == OrderSide.SELL and trade_side != "BUY":
+            return False
+        return True
+    
+    def _calc_rebate(self, qty: float, price: float, fee_bps: int) -> float:
+        return qty * price * fee_bps / 10000 * self.rebate_rate
+    
+    def net_exposure(self, markets: List[Market]) -> float:
+        exp = 0.0
+        for m in markets:
+            inv = self.inventory.get(m.condition_id, {"YES": 0.0, "NO": 0.0})
+            mid = self.client.get_orderbook(m.tokens[0]).midpoint
+            exp += inv["YES"] * mid - inv["NO"] * mid
+        return exp
+    
+    def cancel_stale(self, max_age: int) -> int:
+        cancelled = 0
+        now = time.time()
+        for oid in list(self.open.keys()):
+            if now - self.open[oid].created_at > max_age:
+                if self.cancel_order(oid):
+                    cancelled += 1
+        return cancelled
+
 
 def main():
-    # Parse args
     capital = float(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].replace('.','').isdigit() else 60
     
     aggro = "3"
@@ -259,251 +551,119 @@ def main():
     
     preset = AGGRO[aggro]
     order_size_usd = round(capital * preset["pct"], 2)
-    max_inventory_usd = round(capital * preset["inventory_cap"], 2)
-    order_lifetime = preset["order_lifetime_s"]
-    max_per_market = capital * MAX_PER_MARKET_PCT
-    max_net_exposure = capital * MAX_NET_EXPOSURE_PCT
+    max_inv_usd = round(capital * preset["inventory_cap"], 2)
+    lifetime = preset["order_lifetime_s"]
+    max_per_mkt = capital * MAX_PER_MARKET_PCT
+    max_net = capital * MAX_NET_EXPOSURE_PCT
     
     print("=" * 60)
-    print("  POLYMR - Market Making Bot (REALISTIC)")
+    print("  POLYMR - Market Making Bot")
     print("=" * 60)
-    print(f"\n📊 Capital:         ${capital:,.2f}")
-    print(f"   Order Size:      ${order_size_usd:.2f}")
-    print(f"   Max Position:    ${max_inventory_usd:.2f} per side")
-    print(f"   Per-Market Max:  ${max_per_market:.2f}")
-    print(f"   Order Lifetime:  {order_lifetime}s")
-    print(f"   Gas Place:       ${GAS_PLACE_MATIC * MATIC_TO_USD:.3f}")
-    print(f"   Gas Cancel:      ${GAS_CANCEL_MATIC * MATIC_TO_USD:.3f}")
-    print(f"   Maker Rebate:    {MAKER_REBATE_RATE*100:.0f}%")
-    print(f"   Mode:           {'🔒 SANDBOX' if sandbox else '🚀 REAL'}")
-    print("\n" + "=" * 60)
-    
-    # Initialize
-    order_manager = OrderManager()
-    
-    # Fetch markets
-    print("\n🔌 Fetching 15-minute crypto markets...")
-    markets = fetch_real_markets()
-    
-    if not markets:
-        print("⚠️  No eligible markets found, using sample data")
-        markets = [
-            {"id": "0x1", "question": "BTC > $98K in next 15m?", "tokens": ["0xY1", "0xN1"], "fee_bps": 156, "volume_24h": 15000},
-            {"id": "0x2", "question": "ETH > $3.2K in next 15m?", "tokens": ["0xY2", "0xN2"], "fee_bps": 100, "volume_24h": 12000},
-        ]
-    
-    print(f"   Found {len(markets)} eligible 15-min crypto markets")
-    
-    # State
-    inventory = defaultdict(lambda: {"YES": 0.0, "NO": 0.0})  # {market_id: {"YES": token_qty, "NO": token_qty}}
-    gas_spent = 0.0
-    gross_rebate = 0.0
-    orders_placed = 0
-    orders_filled = 0
-    net_exposure = 0.0  # Positive = net long, Negative = net short
-    cycle = 0
-    
-    # Track open orders per market (don't submit new if we have open)
-    open_market_orders = {m["id"]: {} for m in markets}
+    print(f"  Capital: ${capital:,.2f} | Order: ${order_size_usd:.2f} | Max: ${max_inv_usd:.2f}")
+    print(f"  Lifetime: {lifetime}s | Rebate: {MAKER_REBATE_RATE*100:.0f}% | {'Sandbox' if sandbox else 'Real'}")
+    print("=" * 60)
     
     try:
-        import httpx
-        base = "https://clob.polymarket.com"
-        
+        client = SandboxTradingClient() if sandbox else RealTradingClient()
+    except ValueError as e:
+        print(f"  {e}")
+        print("  Falling back to sandbox...")
+        client = SandboxTradingClient()
+        sandbox = True
+    
+    mgr = OrderManager(client, rebate_rate=MAKER_REBATE_RATE)
+    
+    print("  Fetching markets...")
+    markets = client.get_markets()
+    if not markets:
+        markets = client.get_markets()
+    print(f"  Found {len(markets)} eligible markets")
+    
+    open_orders = {m.condition_id: {"BUY": None, "SELL": None} for m in markets}
+    cycle = 0
+    
+    try:
         while True:
             cycle += 1
-            client = httpx.Client(timeout=5.0)
+            print(f"  Cycle {cycle} | Placed: {mgr.placed} | Filled: {mgr.filled_count}")
             
-            print(f"\n🔄 Cycle {cycle} | Orders: {orders_placed} | Fills: {orders_filled}")
-            
-            # Cancel stale orders
-            cancelled = order_manager.cancel_stale_orders(order_lifetime)
-            if cancelled > 0:
-                print(f"   🗑️  Cancelled {cancelled} stale orders")
-                if not sandbox:
-                    gas_spent += cancelled * GAS_CANCEL_MATIC * MATIC_TO_USD
+            stale = mgr.cancel_stale(lifetime)
+            if stale:
+                print(f"  Cancelled {stale} stale")
             
             for mkt in markets:
-                mkt_id = mkt["id"]
-                tokens = mkt["tokens"]
-                yes_token = tokens[0]
-                no_token = tokens[1] if len(tokens) > 1 else None
-                mid_price = 0.50  # Default if no orderbook
+                book = client.get_orderbook(mkt.tokens[0])
+                fee = client.get_fee_rate(mkt.tokens[0])
                 
-                inv = inventory[mkt_id]
+                for f in mgr.check_fills(mkt):
+                    print(f"  {f['side']} {f['filled_qty']:.2f} @ {f['filled_price']:.4f} | +${f['rebate']:.4f}")
                 
-                # Get orderbook
-                try:
-                    r = client.get(f"{base}/orderbook", params={"token_id": yes_token, "limit": 20})
-                    ob = r.json()
-                except:
-                    ob = {"bids": [], "asks": []}
+                inv = mgr.inventory.get(mkt.condition_id, {"YES": 0.0, "NO": 0.0})
+                yes_q, no_q = inv["YES"], inv["NO"]
+                yes_v, no_v = yes_q * book.midpoint, no_q * book.midpoint
                 
-                bids = ob.get("bids", [])
-                asks = ob.get("asks", [])
-                
-                if bids and asks:
-                    best_bid = bids[0].get("price", 0.50)
-                    best_ask = asks[0].get("price", 0.51)
-                    mid_price = (best_bid + best_ask) / 2
-                    spread_pct = (best_ask - best_bid) / mid_price * 100
-                else:
-                    best_bid = 0.50
-                    best_ask = 0.51
-                    spread_pct = 2.0
-                
-                # Calculate volatility
-                vol = calculate_volatility_from_orderbook(ob)
-                
-                # Check for fills on existing orders
-                fills = order_manager.check_fills_from_orderbook(ob, mkt_id)
-                
-                for fill in fills:
-                    order = order_manager.open_orders.get(fill["order_id"])
-                    if order:
-                        # 100% maker rebate
-                        rebate = fill["filled_qty"] * fill["filled_price"] * mkt["fee_bps"] / 10000
-                        
-                        if sandbox:
-                            gross_rebate += rebate
-                            orders_filled += 1
-                            print(f"   ✅ {order['side']} {fill['filled_qty']:.2f} @ {fill['filled_price']:.4f} | +${rebate:.4f}")
-                        else:
-                            gross_rebate += rebate
-                            orders_filled += 1
-                            print(f"   ✅ {order['side']} {fill['filled_qty']:.2f} @ {fill['filled_price']:.4f} | +${rebate:.4f}")
-                        
-                        # Update inventory (in tokens)
-                        if order["side"] == "BUY":
-                            inventory[mkt_id]["YES"] += fill["filled_qty"]
-                            net_exposure += fill["filled_qty"] * fill["filled_price"]
-                        else:
-                            inventory[mkt_id]["NO"] += fill["filled_qty"]
-                            net_exposure -= fill["filled_qty"] * fill["filled_price"]
-                        
-                        # Remove filled order
-                        del order_manager.open_orders[fill["order_id"]]
-                        if mkt_id in open_market_orders:
-                            open_market_orders[mkt_id].pop(order["side"], None)
-                
-                # Calculate position values in USD
-                yes_value = inventory[mkt_id]["YES"] * mid_price
-                no_value = inventory[mkt_id]["NO"] * mid_price
-                net_value = yes_value - no_value
-                
-                # Check limits
-                if abs(net_exposure) > max_net_exposure:
-                    print(f"   🛑 Max net exposure: ${net_exposure:.2f}")
+                net_exp = mgr.net_exposure(markets)
+                if abs(net_exp) > max_net:
+                    print(f"  Max net exposure: ${net_exp:.2f}")
+                    continue
+                if yes_v > max_per_mkt or no_v > max_per_mkt:
+                    print(f"  Max per-market")
                     continue
                 
-                if yes_value > max_per_market or no_value > max_per_market:
-                    print(f"   🛑 Max per-market exposure")
-                    continue
+                bid = book.bids[0]["price"] if book.bids else 0.50
+                token_qty = order_size_usd / bid if bid > 0 else 0
                 
-                # Calculate token quantities from USD order size
-                token_qty = order_size_usd / best_bid if best_bid > 0 else 0
-                
-                # Calculate queue position and fill probability
-                bid_depth_ahead = sum(b["size"] for b in bids if b["price"] > best_bid - 0.001)
-                ask_depth_ahead = sum(a["size"] for a in asks if a["price"] < best_ask + 0.001)
-                
-                # Queue factor: more depth = lower fill probability
-                queue_factor = min(0.95, max(0.05, token_qty / (bid_depth_ahead + token_qty + 50)))
-                
-                # Volume factor: higher volume = higher fill probability
-                vol_factor = min(1.0, mkt["volume_24h"] / (order_size_usd * 50))
-                
-                # Base fill rate for makers (realistic: 2-5%)
-                base_fill_rate = 0.03 * vol["fill_boost"]
-                fill_prob = base_fill_rate * queue_factor * vol_factor
-                
-                # Skew calculation (YES - NO in USD terms)
-                skew = (yes_value - no_value) / (capital + 1)
-                
-                # Asymmetric skew penalty - encourages rebalancing
-                if skew > 0:  # Too much YES
-                    buy_penalty = max(0.5, 1.0 - abs(skew) * 0.3)  # Reduce buy probability
-                    sell_boost = min(1.5, 1.0 + abs(skew) * 0.3)  # Boost sell probability
-                elif skew < 0:  # Too much NO
-                    buy_penalty = min(1.5, 1.0 + abs(skew) * 0.3)  # Boost buy probability
-                    sell_penalty = max(0.5, 1.0 - abs(skew) * 0.3)  # Reduce sell probability
-                else:
-                    buy_penalty = sell_penalty = 1.0
-                
-                # Spread based on volatility and skew
                 base_spread = random.randint(preset["min_bps"], preset["max_bps"])
-                spread_adj = int(abs(skew) * 10)  # Widen when skewed
-                actual_spread_bps = max(2, base_spread + spread_adj) * vol["spread_mult"]
+                skew = (yes_v - no_v) / (capital + 1)
+                spread_adj = int(abs(skew) * 10)
+                spread = max(2, base_spread + spread_adj)
                 
-                # Quote prices (just behind best bid/ask)
-                buy_price = round(best_bid - (actual_spread_bps * 0.3 / 10000), 4)
-                sell_price = round(best_ask + (actual_spread_bps * 0.3 / 10000), 4)
+                buy_p = round(bid - (spread * 0.3 / 10000), 4)
+                sell_p = round((book.asks[0]["price"] if book.asks else bid) + (spread * 0.3 / 10000), 4)
                 
-                # Maker slippage is near zero (fill at quoted price)
-                maker_slippage = random.uniform(-0.0001, 0.0001)
+                if buy_p <= 0 or buy_p >= 1:
+                    buy_p = round(bid * 0.99, 4)
+                if sell_p <= 0 or sell_p >= 1:
+                    sell_p = round(bid * 1.01, 4)
                 
-                print(f"\n   {mkt['question'][:35]}")
-                print(f"   📊 Mid: {mid_price:.4f} | Spread: {spread_pct:.2f}% | Vol: ${mkt['volume_24h']:,.0f}")
-                print(f"   📦 Inv: YES:{inventory[mkt_id]['YES']:.2f} NO:{inventory[mkt_id]['NO']:.2f} | Skew: {skew*100:.0f}%")
-                print(f"   💰 Fee: {mkt['fee_bps']/100:.2f}% | Fill Prob: {fill_prob*100:.1f}%")
+                print(f"  {mkt.question[:50]}")
+                print(f"  {book.midpoint:.4f} | {book.spread_bps:.0f} bps | ${mkt.volume_24h:,.0f}")
+                print(f"  {yes_q:.2f}/{no_q:.2f} | Skew: {skew*100:.0f}% | Fee: {fee/100:.2f}%")
                 
-                # Submit BUY order if we don't have one and have room
-                if "YES" not in open_market_orders.get(mkt_id, {}):
-                    if yes_value + order_size_usd <= max_inventory_usd:
-                        order_id = order_manager.submit_order("BUY", buy_price, token_qty, yes_token, mkt_id)
-                        open_market_orders.setdefault(mkt_id, {})["YES"] = order_id
-                        orders_placed += 1
-                        
-                        gas = GAS_PLACE_MATIC * MATIC_TO_USD
-                        if not sandbox:
-                            gas_spent += gas
-                        
-                        print(f"   📈 BUY  {token_qty:.2f} @ {buy_price:.4f} | Gas: ${gas:.3f}")
+                if not open_orders[mkt.condition_id]["BUY"] and yes_v + order_size_usd <= max_inv_usd:
+                    o = mgr.submit_order(mkt, OrderSide.BUY, buy_p, token_qty, fee, lifetime)
+                    if o:
+                        open_orders[mkt.condition_id]["BUY"] = o.order_id
+                        print(f"  BUY {token_qty:.2f} @ {buy_p:.4f}")
                 
-                # Submit SELL order
-                if no_token and "NO" not in open_market_orders.get(mkt_id, {}):
-                    if no_value + order_size_usd <= max_inventory_usd:
-                        order_id = order_manager.submit_order("SELL", sell_price, token_qty, no_token, mkt_id)
-                        open_market_orders.setdefault(mkt_id, {})["NO"] = order_id
-                        orders_placed += 1
-                        
-                        gas = GAS_PLACE_MATIC * MATIC_TO_USD
-                        if not sandbox:
-                            gas_spent += gas
-                        
-                        print(f"   📉 SELL {token_qty:.2f} @ {sell_price:.4f} | Gas: ${gas:.3f}")
+                if not open_orders[mkt.condition_id]["SELL"] and no_v + order_size_usd <= max_inv_usd:
+                    o = mgr.submit_order(mkt, OrderSide.SELL, sell_p, token_qty, fee, lifetime)
+                    if o:
+                        open_orders[mkt.condition_id]["SELL"] = o.order_id
+                        print(f"  SELL {token_qty:.2f} @ {sell_p:.4f}")
             
-            client.close()
-            
-            # Stats every 5 cycles
-            if cycle % 5 == 0 and orders_placed > 0:
-                fill_rate = orders_filled / orders_placed * 100
-                net = gross_rebate - gas_spent
-                print(f"\n   📊 STATS: {orders_filled}/{orders_placed} fills ({fill_rate:.0f}%)")
-                print(f"   💰 Gross: ${gross_rebate:.4f} | Gas: ${gas_spent:.4f} | Net: ${net:.4f}")
-                print(f"   📈 Net Exp: ${net_exposure:.2f} | Yield: {(net/capital)*100:.2f}%")
+            if cycle % 5 == 0:
+                rate = mgr.filled_count / mgr.placed * 100 if mgr.placed > 0 else 0
+                net = -mgr.gas_spent
+                print(f"  {mgr.filled_count}/{mgr.placed} fills ({rate:.0f}%)")
+                print(f"  Gas: ${mgr.gas_spent:.4f} | Net: ${net:.4f}")
+                print(f"  Exp: ${net_exp:.2f} | Yield: {(net/capital)*100:.2f}%")
             
             time.sleep(3)
     
     except KeyboardInterrupt:
         pass
     
-    # Summary
-    net = gross_rebate - gas_spent
-    fill_rate = orders_filled / orders_placed * 100 if orders_placed > 0 else 0
+    total_rebates = sum(o.filled_qty * o.filled_price * 156 / 10000 * MAKER_REBATE_RATE for o in mgr.filled)
+    net = total_rebates - mgr.gas_spent
+    rate = mgr.filled_count / mgr.placed * 100 if mgr.placed > 0 else 0
     
-    print("\n" + "=" * 60)
-    print("  FINAL SUMMARY (FULLY REALISTIC)")
     print("=" * 60)
-    print(f"\n  Orders Placed:    {orders_placed}")
-    print(f"  Orders Filled:    {orders_filled} ({fill_rate:.0f}%)")
-    print(f"  Orders Cancelled: {order_manager.cancelled_count}")
-    print(f"  Orders Expired:   {order_manager.expired_count}")
-    print(f"\n  GROSS REBATES:   ${gross_rebate:.4f}")
-    print(f"  Gas Costs:        -${gas_spent:.4f}")
-    print(f"  NET REBATES:      ${net:.4f}")
-    print(f"  NET YIELD:        {(net/capital)*100:.2f}%")
-    print(f"  Net Exposure:     ${net_exposure:.2f}")
+    print("  FINAL SUMMARY")
+    print("=" * 60)
+    print(f"  Placed: {mgr.placed} | Filled: {mgr.filled_count} ({rate:.0f}%) | Cancelled: {mgr.cancelled_count}")
+    print(f"  Rebates: ${total_rebates:.4f} | Gas: ${mgr.gas_spent:.4f} | Net: ${net:.4f}")
+    print(f"  Yield: {(net/capital)*100:.2f}%")
     print("=" * 60)
 
 
