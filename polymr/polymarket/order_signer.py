@@ -4,8 +4,7 @@ Order signing utilities for Polymarket CLOB.
 
 import logging
 from typing import Any, Dict
-
-from ethers import Wallet
+from eth_account import Account
 
 logger = logging.getLogger(__name__)
 
@@ -14,7 +13,7 @@ class OrderSigner:
     """Handles order signing for Polymarket CLOB."""
 
     def __init__(self, private_key: str):
-        self.wallet = Wallet(private_key)
+        self.wallet = Account.from_key(private_key)
         self.address = self.wallet.address
 
     def sign_order(self, order_data: Dict[str, Any]) -> str:
@@ -31,12 +30,13 @@ class OrderSigner:
         """Create the order message for signing."""
         # Polymarket uses a specific message format for orders
         # The message is the keccak hash of the order data
-        import hashlib
+        from web3 import Web3
 
         # Sort keys for consistent hashing
         sorted_data = dict(sorted(order_data.items()))
         data_str = str(sorted_data)
-        message_hash = hashlib.sha3_256(data_str.encode()).hexdigest()
+        w3 = Web3()
+        message_hash = w3.keccak(text=data_str)
         return message_hash
 
     @property

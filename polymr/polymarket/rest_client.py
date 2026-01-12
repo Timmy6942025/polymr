@@ -71,22 +71,17 @@ class PolymarketRESTClient:
     ) -> List[Dict[str, Any]]:
         """
         Fetch markets from Polymarket.
-
-        Args:
-            limit: Maximum number of markets to return.
-            offset: Offset for pagination.
-            active: If True, only return active markets.
-
-        Returns:
-            List of market dictionaries.
         """
         try:
-            response = await self.client.get_markets(
-                limit=limit,
-                offset=offset,
-                active=active,
-            )
-            return response if isinstance(response, list) else []
+            # Use HTTP client directly - py_clob_client has limited API
+            url = f"{self.config.api_url}/markets"
+            params = {"limit": limit, "offset": offset}
+            if active:
+                params["active"] = "true"
+            
+            response = await self.http_client.get(url, params=params)
+            data = response.json()
+            return data.get("markets", []) if isinstance(data, dict) else []
         except Exception as e:
             logger.error(f"Failed to fetch markets: {e}")
             return []
@@ -173,23 +168,11 @@ class PolymarketRESTClient:
     # =========================================================================
 
     async def get_fee_rate(self, token_id: str) -> int:
-        """
-        Get the fee rate for a token.
-
-        For 15-minute crypto markets, this returns the taker fee rate in bps.
-        Fee-free markets return 0.
-
-        Args:
-            token_id: The token ID.
-
-        Returns:
-            Fee rate in basis points (e.g., 1000 = 10%).
-        """
+        """Get the fee rate for a token in bps."""
         try:
-            response = await self.client.get(
-                f"/fee-rate?token_id={token_id}"
-            )
-            return response.get("fee_rate_bps", 0)
+            url = f"{self.config.api_url}/fee-rate"
+            response = await self.http_client.get(url, params={"token_id": token_id})
+            return response.json().get("fee_rate_bps", 0)
         except Exception as e:
             logger.error(f"Failed to fetch fee rate for {token_id}: {e}")
             return 0

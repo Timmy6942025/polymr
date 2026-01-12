@@ -97,8 +97,12 @@ class MarketMakerBot:
 
         self._running = True
 
-        # Start components
-        await self.ws_client.connect()
+        # Start components - WebSocket optional in test mode
+        try:
+            await self.ws_client.connect()
+            logger.info("WebSocket connected")
+        except Exception as e:
+            logger.warning(f"WebSocket connection failed (continuing without real-time updates): {e}")
 
         # Run main loop
         try:

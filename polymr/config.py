@@ -188,6 +188,10 @@ def load_config(config_path: Optional[str] = None) -> Settings:
     Returns:
         Settings object with all configuration loaded.
     """
+    # Load dotenv first
+    from dotenv import load_dotenv
+    load_dotenv()
+
     settings = Settings()
 
     if config_path is None:
