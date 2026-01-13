@@ -1,0 +1,15 @@
+# Dependencies
+node_modules
+.next
+
+# Production
+out
+build
+
+# Testing
+coverage
+.nyc_output
+
+# Misc
+.DS_Store
+*.pem

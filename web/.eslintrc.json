@@ -1,0 +1,6 @@
+{
+  "extends": "next/core-web-vitals",
+  "rules": {
+    ...next/core-web-vitals.recommended,
+  },
+}

@@ -24,11 +24,48 @@ from abc import ABC, abstractmethod
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+from polymr.pricing import (
+    calculate_optimal_spread,
+    calculate_positioning_factor,
+    should_quote_side,
+    calculate_quote_prices,
+    get_aggression_config,
+    PricingConfig,
+    TARGET_REBATE_BPS,
+)
+
 
 AGGRO = {
-    "1": {"name": "Conservative", "pct": 0.10, "min_bps": 15, "max_bps": 50, "inventory_cap": 0.15, "order_lifetime_s": 120},
-    "2": {"name": "Moderate", "pct": 0.20, "min_bps": 8, "max_bps": 30, "inventory_cap": 0.25, "order_lifetime_s": 60},
-    "3": {"name": "Aggressive", "pct": 0.30, "min_bps": 3, "max_bps": 20, "inventory_cap": 0.40, "order_lifetime_s": 30},
+    "1": {
+        "name": "Conservative",
+        "pct": 0.10,
+        "min_spread_bps": 30,
+        "max_spread_bps": 80,
+        "inventory_cap": 0.15,
+        "order_lifetime_s": 120,
+        "buy_stop_threshold": 0.10,
+        "sell_stop_threshold": -0.10,
+    },
+    "2": {
+        "name": "Moderate",
+        "pct": 0.20,
+        "min_spread_bps": 20,
+        "max_spread_bps": 60,
+        "inventory_cap": 0.25,
+        "order_lifetime_s": 60,
+        "buy_stop_threshold": 0.15,
+        "sell_stop_threshold": -0.15,
+    },
+    "3": {
+        "name": "Aggressive",
+        "pct": 0.30,
+        "min_spread_bps": 15,
+        "max_spread_bps": 50,
+        "inventory_cap": 0.40,
+        "order_lifetime_s": 30,
+        "buy_stop_threshold": 0.20,
+        "sell_stop_threshold": -0.20,
+    },
 }
 
 DEFAULT_GAS_PRICE_GWEI = 30
@@ -893,24 +930,41 @@ def main():
                 bid = book.bids[0]["price"] if book.bids else 0.50
                 token_qty = order_size_usd / bid if bid > 0 else 0
                 
-                base_spread = random.randint(preset["min_bps"], preset["max_bps"])
+                # Calculate inventory skew
                 skew = (yes_v - no_v) / (capital + 1)
-                spread_adj = int(abs(skew) * 10)
-                spread = max(2, base_spread + spread_adj)
                 
-                buy_p = round(bid - (spread * 0.3 / 10000), 4)
-                sell_p = round((book.asks[0]["price"] if book.asks else bid) + (spread * 0.3 / 10000), 4)
+                # Calculate optimal spread using new pricing engine
+                fill_rate = mgr.filled_count / mgr.placed if mgr.placed > 0 else 0.20
+                spread_bps = calculate_optimal_spread(
+                    market_spread_bps=book.spread_bps,
+                    volatility_bps=0.5,  # Placeholder for real volatility calc
+                    fill_rate=fill_rate,
+                )
                 
-                if buy_p <= 0 or buy_p >= 1:
-                    buy_p = round(bid * 0.99, 4)
-                if sell_p <= 0 or sell_p >= 1:
-                    sell_p = round(bid * 1.01, 4)
+                # If spread is 0, market is too tight for rebates - skip quoting
+                if spread_bps <= 0:
+                    print(f"  Market spread too tight ({book.spread_bps:.0f} bps < {TARGET_REBATE_BPS} bps rebate threshold)")
+                    continue
+                
+                # Calculate adaptive positioning based on skew
+                positioning = calculate_positioning_factor(skew, spread_bps)
+                
+                # Calculate quote prices
+                buy_p, sell_p = calculate_quote_prices(book.midpoint, spread_bps, positioning, skew)
+                
+                if buy_p is None or sell_p is None:
+                    print(f"  Invalid prices calculated, skipping")
+                    continue
                 
                 print(f"  {mkt.question[:50]}")
-                print(f"  {book.midpoint:.4f} | {book.spread_bps:.0f} bps | ${mkt.volume_24h:,.0f}")
+                print(f"  {book.midpoint:.4f} | Spread: {spread_bps} bps | ${mkt.volume_24h:,.0f}")
                 print(f"  {yes_q:.2f}/{no_q:.2f} | Skew: {skew*100:.0f}% | Fee: {fee/100:.2f}%")
                 
-                if not open_orders[mkt.condition_id]["BUY"] and yes_v + order_size_usd <= max_inv_usd:
+                # One-sided quoting: Check if we should quote each side
+                can_buy = should_quote_side("BUY", skew) and yes_v + order_size_usd <= max_inv_usd
+                can_sell = should_quote_side("SELL", skew) and no_v + order_size_usd <= max_inv_usd
+                
+                if can_buy and not open_orders[mkt.condition_id]["BUY"]:
                     o = mgr.submit_order(mkt, OrderSide.BUY, buy_p, token_qty, fee, lifetime)
                     if o:
                         open_orders[mkt.condition_id]["BUY"] = o.order_id
@@ -918,7 +972,7 @@ def main():
                         if hasattr(client, 'subscribe_token'):
                             client.subscribe_token(mkt.tokens[0])
                 
-                if not open_orders[mkt.condition_id]["SELL"] and no_v + order_size_usd <= max_inv_usd:
+                if can_sell and not open_orders[mkt.condition_id]["SELL"]:
                     o = mgr.submit_order(mkt, OrderSide.SELL, sell_p, token_qty, fee, lifetime)
                     if o:
                         open_orders[mkt.condition_id]["SELL"] = o.order_id
